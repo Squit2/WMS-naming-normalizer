@@ -27,6 +27,7 @@ Optional Streamlit secrets
 
 Public API
 ----------
+  is_sftp_configured()                  → bool              (no network call)
   fetch_all_raw_configs()                → {key: csv_str}   (cached, TTL 5 min)
   parse_config_from_csv_string(s, key)  → config dict
   validate_all_sftp_configs(raw)        → {key: report}
@@ -52,6 +53,26 @@ _DEFAULT_MAPPINGS_DIR = "/mappings"
 _NULL_STRINGS         = {"", "nan", "None"}
 
 
+def is_sftp_configured() -> bool:
+    """
+    Return True if the minimum SFTP credentials are present in st.secrets.
+
+    This is a pure secrets-key check — no network connection is made.
+    Use it as the gate to decide between SFTP mode and local-filesystem mode
+    before attempting any SFTP operation.
+
+    Required keys: SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD
+    """
+    try:
+        host     = st.secrets.get("SFTP_HOST", "").strip()
+        username = st.secrets.get("SFTP_USERNAME", "").strip()
+        password = st.secrets.get("SFTP_PASSWORD", "").strip()
+        return bool(host and username and password)
+    except Exception:
+        # st.secrets raises FileNotFoundError when secrets.toml is absent
+        return False
+
+
 def _sftp_credentials() -> tuple:
     """
     Read SFTP credentials from st.secrets.
@@ -65,7 +86,7 @@ def _sftp_credentials() -> tuple:
     ValueError if mandatory credentials are absent.
     """
     host       = st.secrets.get("SFTP_HOST", "").strip()
-    port       = int(st.secrets.get("SFTP_PORT", 50))
+    port       = int(st.secrets.get("SFTP_PORT", 22))
     user       = st.secrets.get("SFTP_USERNAME", "").strip()
     password   = st.secrets.get("SFTP_PASSWORD", "").strip() or None
     remote_dir = st.secrets.get(
