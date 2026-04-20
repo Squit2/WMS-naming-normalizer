@@ -65,7 +65,7 @@ def _sftp_credentials() -> tuple:
     ValueError if mandatory credentials are absent.
     """
     host       = st.secrets.get("SFTP_HOST", "").strip()
-    port       = int(st.secrets.get("SFTP_PORT", 22))
+    port       = int(st.secrets.get("SFTP_PORT", 50))
     user       = st.secrets.get("SFTP_USERNAME", "").strip()
     password   = st.secrets.get("SFTP_PASSWORD", "").strip() or None
     remote_dir = st.secrets.get(
