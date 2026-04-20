@@ -244,19 +244,24 @@ with st.sidebar:
     st.header("Settings")
     st.caption("☁ SFTP mode" if USE_SFTP else "💾 Local mode")
 
-    # ── Upload a new mapping config ──────────────────────────────────────────
+   # ── Upload a new mapping config ──────────────────────────────────────────
     st.subheader("Upload config")
-    uploaded_config = st.file_uploader(
-        "Drop a customer config here (.csv or .xlsx)",
-        type=["csv", "xlsx"],
-        help=(
-            "Config must have columns: customer_column, wms_field.  \n"
-            "Optional: customer_name, date_format.  \n"
-            "The filename stem becomes the customer key.  Max size: 1 MB."
-        ),
-    )
+    
+    # Wrap the uploader in a form so it only runs ONCE when you click 'Save'
+    with st.form("config_upload_form", clear_on_submit=True):
+        uploaded_config = st.file_uploader(
+            "Drop a customer config here (.csv or .xlsx)",
+            type=["csv", "xlsx"],
+            help=(
+                "Config must have columns: customer_column, wms_field.  \n"
+                "Optional: customer_name, date_format.  \n"
+                "The filename stem becomes the customer key.  Max size: 1 MB."
+            ),
+        )
+        submit_config = st.form_submit_button("Save Config")
 
-    if uploaded_config is not None:
+    # Only process the file IF the submit button was clicked
+    if submit_config and uploaded_config is not None:
         config_bytes = uploaded_config.getvalue()
         ext          = Path(uploaded_config.name).suffix.lower()
 
@@ -270,53 +275,36 @@ with st.sidebar:
             safe_key = sanitise_config_key(uploaded_config.name)
 
             if safe_key == "template":
-                st.error(
-                    "Cannot overwrite the template. "
-                    "Rename your config and re-upload."
-                )
+                st.error("Cannot overwrite the template. Rename your config and re-upload.")
             else:
                 try:
-                    # Normalise to CSV string (xlsx uploads are converted)
                     if ext == ".csv":
                         csv_string = config_bytes.decode("utf-8-sig")
                     else:
                         df_tmp     = pd.read_excel(BytesIO(config_bytes), dtype=str)
                         csv_string = df_tmp.to_csv(index=False)
 
-                    # Validate config structure before writing anywhere
                     parse_config_from_csv_string(csv_string, safe_key)
 
                     if USE_SFTP:
                         result = upload_config_csv(safe_key, csv_string)
                         if result["success"]:
-                            st.success(
-                                "Config saved to SFTP: **{}**".format(safe_key)
-                            )
-                            if ext == ".xlsx":
-                                st.info("XLSX converted to CSV before upload.")
-                            fetch_all_raw_configs.clear()   # bust TTL cache
+                            st.success("Config saved to SFTP: **{}**".format(safe_key))
+                            fetch_all_raw_configs.clear()
                             st.rerun()
                         else:
                             st.error(result["message"])
                     else:
                         dest = MAPPINGS_DIR / "{}.csv".format(safe_key)
                         dest.write_text(csv_string, encoding="utf-8")
-                        st.success(
-                            "Config saved locally: **{}**".format(safe_key)
-                        )
-                        if ext == ".xlsx":
-                            st.info("XLSX converted to CSV on save.")
+                        st.success("Config saved locally: **{}**".format(safe_key))
                         st.rerun()
 
                 except ValueError as _ve:
-                    st.error(
-                        "Invalid config — not saved.  \n"
-                        "Fix the error below and re-upload:  \n"
-                        "`{}`".format(_ve)
-                    )
+                    st.error("Invalid config — not saved.  \nFix the error below and re-upload:  \n`{}`".format(_ve))
                 except Exception as _ue:
                     st.error("Unexpected error reading config: `{}`".format(_ue))
-
+  
     st.divider()
 
     # ── Customer selector ────────────────────────────────────────────────────
