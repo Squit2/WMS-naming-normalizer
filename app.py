@@ -3,49 +3,34 @@ app.py
 ======
 WMS Order File Converter — Streamlit Web Interface
 
+Requires SFTP credentials in .streamlit/secrets.toml:
+    SFTP_HOST         = "your-sftp-host"
+    SFTP_USERNAME     = "your-username"
+    SFTP_PASSWORD     = "your-password"
+    SFTP_PORT         = 22              # optional, default 22
+    SFTP_MAPPINGS_DIR = "/mappings"     # optional, default /mappings
+    SFTP_TARGET_DIR   = "/wms-import"  # for WMS output delivery
+
 Run with:
     streamlit run app.py
 
 Dependencies:
     pip install streamlit pandas paramiko pdfplumber openpyxl
-
-Operating modes
----------------
-SFTP mode  — active when SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD are present
-             in .streamlit/secrets.toml.  Mapping configs are loaded from and
-             saved to an SFTP server; changes survive Streamlit restarts.
-
-Local mode — active when SFTP credentials are absent.  Mapping configs are
-             read from (and written to) the local  mappings/  directory.
-             This is the original behaviour; suitable for local development.
-
-Streamlit secrets (SFTP mode only)
------------------------------------
-SFTP_HOST         = "your-sftp-host"
-SFTP_USERNAME     = "your-username"
-SFTP_PASSWORD     = "your-password"
-SFTP_PORT         = 22              # optional, default 22
-SFTP_MAPPINGS_DIR = "/mappings"     # optional, default /mappings
-
-# Output-delivery SFTP (WMS import folder — used by sftp_uploader.py)
-SFTP_TARGET_DIR   = "/wms-import"
 """
 
 import os
 import re
 import hashlib
 import tempfile
-from io import BytesIO, StringIO
+from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 
 import streamlit as st
 import pandas as pd
 
-# ── Core processing (never modified) ──────────────────────────────────────────
+# ── Core processing ────────────────────────────────────────────────────────────
 from converter import (
-    list_customers,
-    validate_all_customer_configs,
     read_order_file,
     apply_mapping,
     validate,
@@ -55,11 +40,9 @@ from converter import (
     ordered_wms_columns,
     ALL_WMS_FIELDS,
     MANDATORY_FIELDS,
-    MAPPINGS_DIR,
-    MAX_CONFIG_BYTES,
 )
 
-# ── SFTP config persistence layer ─────────────────────────────────────────────
+# ── SFTP config persistence layer ──────────────────────────────────────────────
 from sftp_config_store import (
     is_sftp_configured,
     fetch_all_raw_configs,
@@ -70,20 +53,22 @@ from sftp_config_store import (
     merge_and_save_mappings,
 )
 
-# ── WMS output delivery SFTP (unchanged) ──────────────────────────────────────
+# ── WMS output delivery ────────────────────────────────────────────────────────
 from sftp_uploader import upload_to_wms
 
-# Bridge st.secrets → environment variables consumed by sftp_uploader.py.
-# Only output-delivery keys are bridged; config-storage keys are read directly
-# from st.secrets inside sftp_config_store.py.
+# Bridge st.secrets → os.environ for sftp_uploader.py (output delivery only).
+# Config-storage keys (SFTP_USERNAME, SFTP_MAPPINGS_DIR) are read directly
+# from st.secrets inside sftp_config_store.py — do not bridge those here.
 for _key in ("SFTP_HOST", "SFTP_PORT", "SFTP_USER", "SFTP_PASSWORD",
              "SFTP_PRIVATE_KEY", "SFTP_TARGET_DIR"):
     try:
         if _key in st.secrets and _key not in os.environ:
             os.environ[_key] = str(st.secrets[_key])
     except Exception:
-        pass   # secrets.toml absent — local mode; env vars handled externally
+        pass
 
+# Maximum size allowed for an uploaded config file
+MAX_CONFIG_BYTES = 1 * 1024 * 1024   # 1 MB
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 
@@ -96,27 +81,20 @@ st.set_page_config(
 st.title("📦 WMS Order File Converter")
 st.caption("Convert customer order files into WMS-ready CSV format.")
 
+# ─── GUARD — SFTP must be configured ─────────────────────────────────────────
+# If credentials are missing, stop immediately with a clear instruction.
 
-# ─── OPERATING MODE ──────────────────────────────────────────────────────────
-# Detected once per render cycle via a pure secrets-key check (no network).
-
-USE_SFTP: bool = is_sftp_configured()
-
-if USE_SFTP:
-    st.info(
-        "☁ **SFTP mode** — mapping configs are loaded from and saved to the "
-        "SFTP config store. Changes persist across restarts.",
-        icon="☁",
+if not is_sftp_configured():
+    st.error(
+        "**SFTP credentials are not configured.**  \n"
+        "Add the following keys to `.streamlit/secrets.toml` and restart:  \n"
+        "```\n"
+        "SFTP_HOST     = \"your-sftp-host\"\n"
+        "SFTP_USERNAME = \"your-username\"\n"
+        "SFTP_PASSWORD = \"your-password\"\n"
+        "```"
     )
-else:
-    st.info(
-        "💾 **Local mode** — mapping configs are read from the local "
-        "`mappings/` directory. "
-        "Add SFTP credentials to `.streamlit/secrets.toml` to enable "
-        "cloud persistence.",
-        icon="💾",
-    )
-
+    st.stop()
 
 # ─── SESSION STATE ───────────────────────────────────────────────────────────
 
@@ -129,13 +107,11 @@ for _k, _v in [
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 def sanitise_config_key(raw_name: str) -> str:
     """
     Derive a safe customer_key from an uploaded filename.
-
     Keeps only alphanumerics, hyphens and underscores; strips the extension.
     e.g.  "Gigly Gulp 2026.csv"  →  "Gigly_Gulp_2026"
           "../../evil.py"        →  "______evil"
@@ -145,109 +121,39 @@ def sanitise_config_key(raw_name: str) -> str:
 
 
 def _file_key(file_bytes: bytes, customer_key: str) -> str:
-    """Fingerprint of (file content, customer) used to invalidate proc_result."""
+    """Fingerprint of (file content, customer) — used to invalidate proc_result."""
     digest = hashlib.md5(file_bytes, usedforsecurity=False).hexdigest()[:12]
     return "{}_{}".format(digest, customer_key)
 
 
-def _local_merge_and_save(customer_key: str, new_mappings: dict) -> dict:
-    """
-    Merge new UI-defined mappings into the local config file and write it back.
+# ─── LOAD CONFIGS FROM SFTP ──────────────────────────────────────────────────
 
-    Used only in local mode. Searches for an existing .csv or .xlsx config in
-    MAPPINGS_DIR. Always writes the merged result back as .csv.
-
-    Returns
-    -------
-    dict : {success: bool, message: str, rows_added: int}
-    """
-    existing_df = pd.DataFrame(columns=["customer_column", "wms_field"])
-
-    for _ext in (".csv", ".xlsx"):
-        _candidate = MAPPINGS_DIR / "{}{}".format(customer_key, _ext)
-        if _candidate.exists():
-            try:
-                if _ext == ".csv":
-                    existing_df = pd.read_csv(_candidate, dtype=str)
-                else:
-                    existing_df = pd.read_excel(_candidate, dtype=str)
-                existing_df.columns = [c.strip().lower() for c in existing_df.columns]
-                if "customer_column" in existing_df.columns and \
-                   "wms_field" in existing_df.columns:
-                    existing_df = existing_df[
-                        ["customer_column", "wms_field"]
-                    ].copy()
-                else:
-                    existing_df = pd.DataFrame(columns=["customer_column", "wms_field"])
-            except Exception:
-                existing_df = pd.DataFrame(columns=["customer_column", "wms_field"])
-            break
-
-    df_new = pd.DataFrame(
-        [{"customer_column": k, "wms_field": v} for k, v in new_mappings.items()]
+try:
+    raw_configs        = fetch_all_raw_configs()
+    all_config_reports = validate_all_sftp_configs(raw_configs)
+    customers          = list_sftp_customers(raw_configs)
+except (RuntimeError, ImportError) as _sftp_err:
+    st.error(
+        "**SFTP connection failed.**  \n"
+        "Credentials were found but the server could not be reached.  \n"
+        "Check network, host and port settings, then reload the page.  \n\n"
+        "Error: `{}`".format(_sftp_err)
     )
-    df_merged = (
-        pd.concat([existing_df, df_new], ignore_index=True)
-        .drop_duplicates(subset=["customer_column"], keep="last")
-        .reset_index(drop=True)
-    )
-    rows_added = max(len(df_merged) - len(existing_df), 0)
-    dest       = MAPPINGS_DIR / "{}.csv".format(customer_key)
-
-    try:
-        dest.write_text(df_merged.to_csv(index=False), encoding="utf-8")
-        return {
-            "success":    True,
-            "message":    "Config '{}' updated locally ({}).".format(customer_key, dest.name),
-            "rows_added": rows_added,
-        }
-    except OSError as exc:
-        return {
-            "success":    False,
-            "message":    "Could not write local config: {}".format(exc),
-            "rows_added": 0,
-        }
-
-
-# ─── LOAD CONFIGS (mode-aware) ───────────────────────────────────────────────
-
-raw_configs: dict = {}   # populated in SFTP mode only
-
-if USE_SFTP:
-    try:
-        raw_configs        = fetch_all_raw_configs()
-        all_config_reports = validate_all_sftp_configs(raw_configs)
-        customers          = list_sftp_customers(raw_configs)
-    except (RuntimeError, ImportError) as _sftp_err:
-        # Credentials were present but the connection failed — this is a real
-        # infrastructure error, not a missing-secrets issue.
-        st.error(
-            "**SFTP connection failed.**  \n"
-            "Credentials were found in secrets but the server could not be reached.  \n"
-            "Check network, host and port settings, then reload the page.  \n\n"
-            "Error: `{}`".format(_sftp_err)
-        )
-        st.stop()
-else:
-    # Local mode — delegate entirely to converter's existing functions.
-    all_config_reports = validate_all_customer_configs()
-    customers          = list_customers()
+    st.stop()
 
 invalid_configs = sorted(
     key for key, r in all_config_reports.items() if r["errors"]
 )
 
-
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("☁ SFTP mode" if USE_SFTP else "💾 Local mode")
+    st.caption("☁ SFTP mode")
 
-   # ── Upload a new mapping config ──────────────────────────────────────────
+    # ── Upload a new mapping config ──────────────────────────────────────────
     st.subheader("Upload config")
-    
-    # Wrap the uploader in a form so it only runs ONCE when you click 'Save'
+
     with st.form("config_upload_form", clear_on_submit=True):
         uploaded_config = st.file_uploader(
             "Drop a customer config here (.csv or .xlsx)",
@@ -255,12 +161,11 @@ with st.sidebar:
             help=(
                 "Config must have columns: customer_column, wms_field.  \n"
                 "Optional: customer_name, date_format.  \n"
-                "The filename stem becomes the customer key.  Max size: 1 MB."
+                "The filename stem becomes the customer key. Max size: 1 MB."
             ),
         )
         submit_config = st.form_submit_button("Save Config")
 
-    # Only process the file IF the submit button was clicked
     if submit_config and uploaded_config is not None:
         config_bytes = uploaded_config.getvalue()
         ext          = Path(uploaded_config.name).suffix.lower()
@@ -284,41 +189,34 @@ with st.sidebar:
                         df_tmp     = pd.read_excel(BytesIO(config_bytes), dtype=str)
                         csv_string = df_tmp.to_csv(index=False)
 
+                    # Validate before saving — reject broken configs early
                     parse_config_from_csv_string(csv_string, safe_key)
 
-                    if USE_SFTP:
-                        result = upload_config_csv(safe_key, csv_string)
-                        if result["success"]:
-                            st.success("Config saved to SFTP: **{}**".format(safe_key))
-                            fetch_all_raw_configs.clear()
-                            st.rerun()
-                        else:
-                            st.error(result["message"])
-                    else:
-                        dest = MAPPINGS_DIR / "{}.csv".format(safe_key)
-                        dest.write_text(csv_string, encoding="utf-8")
-                        st.success("Config saved locally: **{}**".format(safe_key))
+                    result = upload_config_csv(safe_key, csv_string)
+                    if result["success"]:
+                        st.success("Config saved to SFTP: **{}**".format(safe_key))
+                        fetch_all_raw_configs.clear()
                         st.rerun()
+                    else:
+                        st.error(result["message"])
 
                 except ValueError as _ve:
-                    st.error("Invalid config — not saved.  \nFix the error below and re-upload:  \n`{}`".format(_ve))
+                    st.error(
+                        "Invalid config — not saved.  \n"
+                        "Fix the error below and re-upload:  \n"
+                        "`{}`".format(_ve)
+                    )
                 except Exception as _ue:
                     st.error("Unexpected error reading config: `{}`".format(_ue))
-  
+
     st.divider()
 
     # ── Customer selector ────────────────────────────────────────────────────
     if not customers:
-        if USE_SFTP:
-            st.error(
-                "No customer configs found on SFTP (`/mappings/*.csv`).  \n"
-                "Upload a config file above to get started."
-            )
-        else:
-            st.error(
-                "No customer configs found in `mappings/`.  \n"
-                "Add a `.csv` or `.xlsx` config file to that directory."
-            )
+        st.error(
+            "No customer configs found on SFTP (`/mappings/*.csv`).  \n"
+            "Upload a config file above to get started."
+        )
         st.stop()
 
     if invalid_configs:
@@ -450,7 +348,7 @@ if uploaded_file and config_is_valid:
         st.session_state["proc_file_key"] = current_file_key
         st.session_state["saved_mapping"] = {}
 
-    # ── Read raw file (fast — always done to detect unmapped columns) ─────────
+    # ── Read raw file ─────────────────────────────────────────────────────────
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
@@ -470,7 +368,7 @@ if uploaded_file and config_is_valid:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
 
-    # ── Detect unmapped columns (case-insensitive, mirrors apply_mapping) ─────
+    # ── Detect unmapped columns ───────────────────────────────────────────────
     known_source_cols = {k.lower() for k in config["column_map"]}
     unmapped_cols     = [
         col for col in df_raw.columns
@@ -556,7 +454,7 @@ if uploaded_file and config_is_valid:
         }
         st.session_state["saved_mapping"] = {}
 
-    # ── Display results (persisted in session state) ──────────────────────────
+    # ── Display results ───────────────────────────────────────────────────────
     proc = st.session_state.get("proc_result")
 
     if proc and st.session_state["proc_file_key"] == current_file_key:
@@ -666,7 +564,7 @@ if uploaded_file and config_is_valid:
                 )
             )
 
-        # ── Save new mappings back (mode-aware) ───────────────────────────────
+        # ── Save new mappings back to SFTP ────────────────────────────────────
         conv_user_mapping = proc.get("user_mapping", {})
 
         if conv_user_mapping:
@@ -698,24 +596,12 @@ if uploaded_file and config_is_valid:
                     use_container_width=True,
                 )
 
-                _save_label = (
-                    "💾 Save new mappings to SFTP"
-                    if USE_SFTP
-                    else "💾 Save new mappings to local config"
-                )
-
-                if st.button(_save_label):
-                    if USE_SFTP:
-                        save_result = merge_and_save_mappings(
-                            customer_key=customer_key,
-                            existing_csv_string=raw_configs.get(customer_key, ""),
-                            new_mappings=conv_user_mapping,
-                        )
-                    else:
-                        save_result = _local_merge_and_save(
-                            customer_key, conv_user_mapping
-                        )
-
+                if st.button("💾 Save new mappings to SFTP"):
+                    save_result = merge_and_save_mappings(
+                        customer_key=customer_key,
+                        existing_csv_string=raw_configs.get(customer_key, ""),
+                        new_mappings=conv_user_mapping,
+                    )
                     if save_result["success"]:
                         st.success(
                             "{} — {} new row(s) added.".format(
@@ -724,16 +610,12 @@ if uploaded_file and config_is_valid:
                             )
                         )
                         st.session_state["saved_mapping"] = dict(conv_user_mapping)
-                        if USE_SFTP:
-                            fetch_all_raw_configs.clear()
+                        fetch_all_raw_configs.clear()
                     else:
                         st.error(save_result["message"])
 
 else:
-    if config_is_valid:
-        st.info("Upload a customer order file above to begin.")
-    else:
-        st.info("Fix config errors in the sidebar first, then upload a file.")
+    st.info("Upload a customer order file above to begin.")
 
 
 # ─── DOWNLOAD + WMS UPLOAD (outside if/else — survives reruns) ───────────────
@@ -773,10 +655,5 @@ if payload:
 st.divider()
 st.caption(
     "WMS Order File Converter | WMS / GIT Department | "
-    + (
-        "Mapping configs are stored on SFTP. Upload new configs via the sidebar."
-        if USE_SFTP else
-        "Mapping configs are in the local mappings/ directory. "
-        "Add SFTP credentials to secrets.toml to enable cloud persistence."
-    )
+    "Mapping configs are stored on SFTP. Upload new configs via the sidebar."
 )
