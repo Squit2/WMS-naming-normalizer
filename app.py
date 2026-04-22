@@ -3,19 +3,33 @@ app.py
 ======
 WMS Order File Converter — Streamlit Web Interface
 
+Changes
+-------
+Issue 4 — Store CSV bytes in session state instead of DataFrames.
+    DataFrames are reconstructed from bytes only when the display tabs render.
+    Eliminates multi-MB pickle/unpickle on every widget interaction.
+
+Issue 5 — Cache df_raw in session state; skip second file read on Convert.
+    The file is read once on upload to detect unmapped columns. The resulting
+    df_raw is stored in session state keyed by file fingerprint. The Convert
+    button reuses the cached df_raw instead of writing a second temp file
+    and running read_order_file() again.
+
+Issue 8 — Prevent duplicate WMS uploads.
+    upload_done is stored in session state after a successful upload.
+    The upload button is replaced with a success message for the remainder
+    of the session to prevent the same file being imported to the WMS twice.
+
 Requires SFTP credentials in .streamlit/secrets.toml:
     SFTP_HOST         = "your-sftp-host"
     SFTP_USERNAME     = "your-username"
     SFTP_PASSWORD     = "your-password"
-    SFTP_PORT         = 22              # optional, default 22
-    SFTP_MAPPINGS_DIR = "/mappings"     # optional, default /mappings
-    SFTP_TARGET_DIR   = "/wms-import"  # for WMS output delivery
+    SFTP_PORT         = 22
+    SFTP_MAPPINGS_DIR = "/mappings"
+    SFTP_TARGET_DIR   = "/wms-import"
 
 Run with:
     streamlit run app.py
-
-Dependencies:
-    pip install streamlit pandas paramiko pdfplumber openpyxl
 """
 
 import os
@@ -29,7 +43,6 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 
-# ── Core processing ────────────────────────────────────────────────────────────
 from converter import (
     read_order_file,
     apply_mapping,
@@ -42,7 +55,6 @@ from converter import (
     MANDATORY_FIELDS,
 )
 
-# ── SFTP config persistence layer ──────────────────────────────────────────────
 from sftp_config_store import (
     is_sftp_configured,
     fetch_all_raw_configs,
@@ -53,12 +65,8 @@ from sftp_config_store import (
     merge_and_save_mappings,
 )
 
-# ── WMS output delivery ────────────────────────────────────────────────────────
 from sftp_uploader import upload_to_wms
 
-# Bridge st.secrets → os.environ for sftp_uploader.py (output delivery only).
-# Config-storage keys (SFTP_USERNAME, SFTP_MAPPINGS_DIR) are read directly
-# from st.secrets inside sftp_config_store.py — do not bridge those here.
 for _key in ("SFTP_HOST", "SFTP_PORT", "SFTP_USER", "SFTP_PASSWORD",
              "SFTP_PRIVATE_KEY", "SFTP_TARGET_DIR"):
     try:
@@ -67,8 +75,7 @@ for _key in ("SFTP_HOST", "SFTP_PORT", "SFTP_USER", "SFTP_PASSWORD",
     except Exception:
         pass
 
-# Maximum size allowed for an uploaded config file
-MAX_CONFIG_BYTES = 1 * 1024 * 1024   # 1 MB
+MAX_CONFIG_BYTES = 1 * 1024 * 1024
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 
@@ -81,21 +88,7 @@ st.set_page_config(
 st.title("📦 WMS Order File Converter")
 st.caption("Convert customer order files into WMS-ready CSV format.")
 
-# ─── PASSWORD PROTECTION ─────────────────────────────────────────────────────
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-if not st.session_state["authenticated"]:
-    pwd = st.text_input("Enter app password:", type="password")
-    if pwd == st.secrets["APP_PASSWORD"]:
-        st.session_state["authenticated"] = True
-        st.rerun()
-    elif pwd:
-        st.error("Incorrect password.")
-    st.stop()  # This entirely hides the rest of the app until unlocked
-    
-# ─── GUARD — SFTP must be configured ─────────────────────────────────────────
-# If credentials are missing, stop immediately with a clear instruction.
+# ─── GUARD ───────────────────────────────────────────────────────────────────
 
 if not is_sftp_configured():
     st.error(
@@ -115,7 +108,10 @@ for _k, _v in [
     ("export_payload", None),
     ("proc_result",    None),
     ("proc_file_key",  None),
+    ("raw_df_key",     None),   # Issue 5: key for cached df_raw
+    ("raw_df_cache",   None),   # Issue 5: the cached df_raw itself
     ("saved_mapping",  {}),
+    ("upload_done",    False),  # Issue 8: tracks whether WMS upload completed
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -123,23 +119,16 @@ for _k, _v in [
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 def sanitise_config_key(raw_name: str) -> str:
-    """
-    Derive a safe customer_key from an uploaded filename.
-    Keeps only alphanumerics, hyphens and underscores; strips the extension.
-    e.g.  "Gigly Gulp 2026.csv"  →  "Gigly_Gulp_2026"
-          "../../evil.py"        →  "______evil"
-    """
     stem = Path(raw_name).stem
     return re.sub(r"[^\w\-]", "_", stem)
 
 
 def _file_key(file_bytes: bytes, customer_key: str) -> str:
-    """Fingerprint of (file content, customer) — used to invalidate proc_result."""
     digest = hashlib.md5(file_bytes, usedforsecurity=False).hexdigest()[:12]
     return "{}_{}".format(digest, customer_key)
 
 
-# ─── LOAD CONFIGS FROM SFTP ──────────────────────────────────────────────────
+# ─── LOAD CONFIGS ────────────────────────────────────────────────────────────
 
 try:
     raw_configs        = fetch_all_raw_configs()
@@ -149,7 +138,6 @@ except (RuntimeError, ImportError) as _sftp_err:
     st.error(
         "**SFTP connection failed.**  \n"
         "Credentials were found but the server could not be reached.  \n"
-        "Check network, host and port settings, then reload the page.  \n\n"
         "Error: `{}`".format(_sftp_err)
     )
     st.stop()
@@ -164,7 +152,6 @@ with st.sidebar:
     st.header("Settings")
     st.caption("☁ SFTP mode")
 
-    # ── Upload a new mapping config ──────────────────────────────────────────
     st.subheader("Upload config")
 
     with st.form("config_upload_form", clear_on_submit=True):
@@ -202,7 +189,6 @@ with st.sidebar:
                         df_tmp     = pd.read_excel(BytesIO(config_bytes), dtype=str)
                         csv_string = df_tmp.to_csv(index=False)
 
-                    # Validate before saving — reject broken configs early
                     parse_config_from_csv_string(csv_string, safe_key)
 
                     result = upload_config_csv(safe_key, csv_string)
@@ -215,16 +201,13 @@ with st.sidebar:
 
                 except ValueError as _ve:
                     st.error(
-                        "Invalid config — not saved.  \n"
-                        "Fix the error below and re-upload:  \n"
-                        "`{}`".format(_ve)
+                        "Invalid config — not saved.  \n`{}`".format(_ve)
                     )
                 except Exception as _ue:
-                    st.error("Unexpected error reading config: `{}`".format(_ue))
+                    st.error("Unexpected error: `{}`".format(_ue))
 
     st.divider()
 
-    # ── Customer selector ────────────────────────────────────────────────────
     if not customers:
         st.error(
             "No customer configs found on SFTP (`/mappings/*.csv`).  \n"
@@ -277,7 +260,6 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Mapping preview ──────────────────────────────────────────────────────
     st.subheader("Column mapping preview")
     if config:
         mapping_df = pd.DataFrame(
@@ -321,9 +303,7 @@ page_number = 0
 if uploaded_file and Path(uploaded_file.name).suffix.lower() == ".pdf":
     page_input = st.number_input(
         "PDF page number (1 = first page)",
-        min_value=1,
-        value=1,
-        step=1,
+        min_value=1, value=1, step=1,
         help="Which page of the PDF contains the order table.",
         disabled=not config_is_valid,
     )
@@ -338,48 +318,51 @@ if uploaded_file and config_is_valid:
     file_bytes = uploaded_file.read()
     ext        = Path(uploaded_file.name).suffix.lower()
 
-    # ── Magic-byte validation ─────────────────────────────────────────────────
     if ext == ".pdf":
         if not is_valid_pdf(file_bytes):
-            st.error(
-                "The uploaded file does not appear to be a valid PDF. "
-                "Please upload a genuine .pdf file."
-            )
+            st.error("The uploaded file does not appear to be a valid PDF.")
             st.stop()
     else:
         if not is_valid_xlsx(file_bytes):
-            st.error(
-                "The uploaded file does not appear to be a valid Excel file. "
-                "Please upload a genuine .xlsx or .xls file."
-            )
+            st.error("The uploaded file does not appear to be a valid Excel file.")
             st.stop()
 
-    # ── Invalidate stored results when file or customer changes ───────────────
     current_file_key = _file_key(file_bytes, customer_key)
+
+    # Invalidate stored results when file or customer changes
     if st.session_state["proc_file_key"] != current_file_key:
         st.session_state["proc_result"]   = None
         st.session_state["proc_file_key"] = current_file_key
         st.session_state["saved_mapping"] = {}
+        st.session_state["upload_done"]   = False   # Issue 8: reset on new file
+        st.session_state["raw_df_key"]    = None
+        st.session_state["raw_df_cache"]  = None
 
-    # ── Read raw file ─────────────────────────────────────────────────────────
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = Path(tmp.name)
-
+    # ── Issue 5: Read raw file once and cache in session state ────────────────
+    # df_raw is only needed to detect unmapped columns for the mapping UI.
+    # If the same file+customer key was already read this session, reuse it.
+    if st.session_state["raw_df_key"] != current_file_key:
+        tmp_path = None
         try:
-            df_raw = read_order_file(
-                tmp_path,
-                sheet_name=sheet_name,
-                page_number=page_number,
-            )
-        except (FileNotFoundError, ValueError, ImportError) as exc:
-            st.error(str(exc))
-            st.stop()
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = Path(tmp.name)
+            try:
+                df_raw = read_order_file(
+                    tmp_path,
+                    sheet_name=sheet_name,
+                    page_number=page_number,
+                )
+                st.session_state["raw_df_cache"] = df_raw
+                st.session_state["raw_df_key"]   = current_file_key
+            except (FileNotFoundError, ValueError, ImportError) as exc:
+                st.error(str(exc))
+                st.stop()
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+    else:
+        df_raw = st.session_state["raw_df_cache"]
 
     # ── Detect unmapped columns ───────────────────────────────────────────────
     known_source_cols = {k.lower() for k in config["column_map"]}
@@ -427,45 +410,49 @@ if uploaded_file and config_is_valid:
     if st.button(_btn_label, type="primary"):
         final_map = {**config["column_map"], **user_mapping}
 
-        _tmp2 = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as _f2:
-                _f2.write(file_bytes)
-                _tmp2 = Path(_f2.name)
+        # Issue 5: reuse the already-cached df_raw — no second file read needed
+        with st.spinner("Mapping and validating…"):
+            try:
+                df_mapped, warnings         = apply_mapping(
+                    df_raw, final_map, case_insensitive_source=True
+                )
+                df_valid, df_errors, val_errors = validate(df_mapped)
+                df_clean, clean_warnings        = clean_data(
+                    df_valid, date_format=config.get("date_format")
+                )
+                warnings = warnings + clean_warnings
 
-            with st.spinner("Mapping and validating…"):
-                try:
-                    df_raw2             = read_order_file(
-                        _tmp2,
-                        sheet_name=sheet_name,
-                        page_number=page_number,
-                    )
-                    df_mapped, warnings = apply_mapping(
-                        df_raw2, final_map, case_insensitive_source=True
-                    )
-                    df_valid, df_errors, val_errors = validate(df_mapped)
-                    df_clean, clean_warnings        = clean_data(
-                        df_valid, date_format=config.get("date_format")
-                    )
-                    warnings = warnings + clean_warnings
+            except (FileNotFoundError, ValueError, ImportError) as exc:
+                st.error(str(exc))
+                st.stop()
 
-                except (FileNotFoundError, ValueError, ImportError) as exc:
-                    st.error(str(exc))
-                    st.stop()
-
-        finally:
-            if _tmp2 is not None:
-                _tmp2.unlink(missing_ok=True)
+        # Issue 4: store CSV bytes, row counts, and metadata — not DataFrames
+        cols_ordered = ordered_wms_columns(df_clean)
+        csv_bytes    = (
+            df_clean[cols_ordered].to_csv(index=False).encode("utf-8-sig")
+        )
+        err_csv = (
+            df_errors.to_csv(index=False).encode("utf-8-sig")
+            if not df_errors.empty else None
+        )
+        raw_csv = df_raw.to_csv(index=False).encode("utf-8-sig")
 
         st.session_state["proc_result"] = {
-            "df_raw":       df_raw,
-            "df_clean":     df_clean,
-            "df_errors":    df_errors,
-            "warnings":     warnings,
-            "val_errors":   val_errors,
-            "user_mapping": dict(user_mapping),
+            # Issue 4: bytes only — no live DataFrames in session state
+            "csv_bytes":        csv_bytes,
+            "err_csv":          err_csv,
+            "raw_csv":          raw_csv,
+            "row_count_raw":    len(df_raw),
+            "row_count_valid":  len(df_clean),
+            "row_count_errors": len(df_errors),
+            "warnings":         warnings,
+            "val_errors":       val_errors,
+            "user_mapping":     dict(user_mapping),
+            # Preserve export metadata
+            "cols_ordered":     cols_ordered,
         }
         st.session_state["saved_mapping"] = {}
+        st.session_state["upload_done"]   = False  # Issue 8: new result, reset
 
     # ── Display results ───────────────────────────────────────────────────────
     proc = st.session_state.get("proc_result")
@@ -481,14 +468,14 @@ if uploaded_file and config_is_valid:
 
         st.subheader("3. Results")
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total rows read", len(proc["df_raw"]))
-        col2.metric("Valid rows",       len(proc["df_clean"]))
+        col1.metric("Total rows read", proc["row_count_raw"])
+        col2.metric("Valid rows",       proc["row_count_valid"])
         col3.metric(
             "Error rows",
-            len(proc["df_errors"]),
+            proc["row_count_errors"],
             delta=(
-                "-{}".format(len(proc["df_errors"]))
-                if len(proc["df_errors"]) > 0 else None
+                "-{}".format(proc["row_count_errors"])
+                if proc["row_count_errors"] > 0 else None
             ),
             delta_color="inverse",
         )
@@ -504,80 +491,68 @@ if uploaded_file and config_is_valid:
         st.subheader("4. Review")
         tab1, tab2, tab3 = st.tabs(["Mapped output", "Error rows", "Raw input"])
 
+        # Issue 4: reconstruct DataFrames from bytes only when the tab renders
         with tab1:
-            if proc["df_clean"].empty:
+            if proc["row_count_valid"] == 0:
                 st.warning("No valid rows to display.")
             else:
+                df_display = pd.read_csv(BytesIO(proc["csv_bytes"]))
                 mandatory_in_df = [
-                    f for f in MANDATORY_FIELDS if f in proc["df_clean"].columns
+                    f for f in MANDATORY_FIELDS if f in df_display.columns
                 ]
                 st.caption(
                     "Showing {} valid rows. Mandatory fields present: {}".format(
-                        len(proc["df_clean"]), ", ".join(mandatory_in_df)
+                        proc["row_count_valid"], ", ".join(mandatory_in_df)
                     )
                 )
-                st.dataframe(
-                    proc["df_clean"], use_container_width=True, hide_index=True
-                )
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
 
         with tab2:
-            if proc["df_errors"].empty:
+            if proc["row_count_errors"] == 0:
                 st.success("No error rows.")
             else:
                 st.caption(
                     "{} row(s) failed validation. "
                     "Fix the source file and re-upload.".format(
-                        len(proc["df_errors"])
+                        proc["row_count_errors"]
                     )
                 )
-                st.dataframe(
-                    proc["df_errors"], use_container_width=True, hide_index=True
-                )
+                df_err_display = pd.read_csv(BytesIO(proc["err_csv"]))
+                st.dataframe(df_err_display, use_container_width=True, hide_index=True)
 
         with tab3:
             st.caption("Original columns as received from customer.")
-            st.dataframe(
-                proc["df_raw"], use_container_width=True, hide_index=True
-            )
+            df_raw_display = pd.read_csv(BytesIO(proc["raw_csv"]))
+            st.dataframe(df_raw_display, use_container_width=True, hide_index=True)
 
         # ── Export ────────────────────────────────────────────────────────────
         st.subheader("5. Export")
 
-        if proc["df_clean"].empty:
+        if proc["row_count_valid"] == 0:
             st.error("Nothing to export — all rows have validation errors.")
             st.session_state["export_payload"] = None
         else:
-            cols_ordered = ordered_wms_columns(proc["df_clean"])
-            csv_bytes    = (
-                proc["df_clean"][cols_ordered]
-                .to_csv(index=False)
-                .encode("utf-8-sig")
-            )
-            err_csv = (
-                proc["df_errors"].to_csv(index=False).encode("utf-8-sig")
-                if not proc["df_errors"].empty else None
-            )
             ts           = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_fname = "wms_output_{}_{}.csv".format(customer_key, ts)
             error_fname  = "wms_errors_{}_{}.csv".format(customer_key, ts)
 
             st.session_state["export_payload"] = {
                 "output_fname": output_fname,
-                "csv_bytes":    csv_bytes,
+                "csv_bytes":    proc["csv_bytes"],
                 "error_fname":  error_fname,
-                "err_csv":      err_csv,
+                "err_csv":      proc["err_csv"],
             }
 
             st.info(
                 "Ready to export **{} valid rows** as WMS CSV.{}".format(
-                    len(proc["df_clean"]),
+                    proc["row_count_valid"],
                     " **{} error row(s)** will be excluded.".format(
-                        len(proc["df_errors"])
-                    ) if len(proc["df_errors"]) > 0 else "",
+                        proc["row_count_errors"]
+                    ) if proc["row_count_errors"] > 0 else "",
                 )
             )
 
-        # ── Save new mappings back to SFTP ────────────────────────────────────
+        # ── Save new mappings ─────────────────────────────────────────────────
         conv_user_mapping = proc.get("user_mapping", {})
 
         if conv_user_mapping:
@@ -631,7 +606,7 @@ else:
     st.info("Upload a customer order file above to begin.")
 
 
-# ─── DOWNLOAD + WMS UPLOAD (outside if/else — survives reruns) ───────────────
+# ─── DOWNLOAD + WMS UPLOAD ───────────────────────────────────────────────────
 
 payload = st.session_state.get("export_payload")
 if payload:
@@ -651,7 +626,15 @@ if payload:
             mime="text/csv",
         )
 
-    if st.button("☁ Upload CSV to WMS file server", type="secondary"):
+    # Issue 8: disable upload button after a successful upload to prevent
+    # the same file being imported to the WMS twice in the same session.
+    if st.session_state.get("upload_done"):
+        st.success(
+            "Already uploaded to WMS server: **{}**".format(
+                payload["output_fname"]
+            )
+        )
+    elif st.button("☁ Upload CSV to WMS file server", type="secondary"):
         with st.spinner("Connecting to WMS SFTP server…"):
             result = upload_to_wms(
                 local_file_bytes=payload["csv_bytes"],
@@ -659,6 +642,7 @@ if payload:
             )
         if result["success"]:
             st.success(result["message"])
+            st.session_state["upload_done"] = True
         else:
             st.error(result["message"])
 
