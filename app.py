@@ -81,6 +81,19 @@ st.set_page_config(
 st.title("📦 WMS Order File Converter")
 st.caption("Convert customer order files into WMS-ready CSV format.")
 
+# ─── PASSWORD PROTECTION ─────────────────────────────────────────────────────
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if not st.session_state["authenticated"]:
+    pwd = st.text_input("Enter app password:", type="password")
+    if pwd == st.secrets["APP_PASSWORD"]:
+        st.session_state["authenticated"] = True
+        st.rerun()
+    elif pwd:
+        st.error("Incorrect password.")
+    st.stop()  # This entirely hides the rest of the app until unlocked
+    
 # ─── GUARD — SFTP must be configured ─────────────────────────────────────────
 # If credentials are missing, stop immediately with a clear instruction.
 
