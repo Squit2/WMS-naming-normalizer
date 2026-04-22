@@ -4,36 +4,21 @@ sftp_config_store.py
 ====================
 SFTP-backed persistence layer for WMS customer mapping configs.
 
-Replaces the local mappings/ directory with .csv configs stored on an SFTP
-server, enabling persistence across Streamlit restarts (ephemeral filesystem).
+Changes
+-------
+Issue 1 — Connection pooling via @st.cache_resource.
+    A single paramiko Transport is opened once per Streamlit server process
+    and reused for all subsequent SFTP operations, eliminating the per-call
+    SSH handshake overhead (300-800ms per operation).
 
-Directory layout on SFTP server
---------------------------------
-/mappings/           ← default; override with SFTP_MAPPINGS_DIR secret
-  customer_a.csv
-  customer_b.csv
-  template.csv       ← always skipped
+Issue 2 — Lazy per-config fetch instead of bulk fetch.
+    list_sftp_config_keys() fetches only filenames (one SFTP listdir call).
+    fetch_raw_config() fetches a single config by key on demand and caches
+    it individually. fetch_all_raw_configs() is retained for compatibility
+    but now delegates to the per-key cache rather than reading everything
+    on every miss.
 
-Required Streamlit secrets
---------------------------
-  SFTP_HOST         hostname or IP of the SFTP server
-  SFTP_USERNAME     SSH username
-  SFTP_PASSWORD     SSH password
-
-Optional Streamlit secrets
---------------------------
-  SFTP_PORT         default 22
-  SFTP_MAPPINGS_DIR default /mappings
-
-Public API
-----------
-  is_sftp_configured()                  → bool              (no network call)
-  fetch_all_raw_configs()                → {key: csv_str}   (cached, TTL 5 min)
-  parse_config_from_csv_string(s, key)  → config dict
-  validate_all_sftp_configs(raw)        → {key: report}
-  list_sftp_customers(raw)              → [key, ...]
-  upload_config_csv(key, csv_str)       → {success, message}
-  merge_and_save_mappings(key, old, new)→ {success, message}
+Issue 6 — NULL_STRINGS imported from converter instead of redefined.
 """
 
 import contextlib
@@ -43,25 +28,19 @@ from io import StringIO
 import pandas as pd
 import streamlit as st
 
-from converter import ALL_WMS_FIELDS, MANDATORY_FIELDS
+from converter import ALL_WMS_FIELDS, MANDATORY_FIELDS, NULL_STRINGS
 
 # ─── INTERNALS ───────────────────────────────────────────────────────────────
 
 log = logging.getLogger(__name__)
 
 _DEFAULT_MAPPINGS_DIR = "/mappings"
-_NULL_STRINGS         = {"", "nan", "None"}
 
 
 def is_sftp_configured() -> bool:
     """
     Return True if the minimum SFTP credentials are present in st.secrets.
-
-    This is a pure secrets-key check — no network connection is made.
-    Use it as the gate to decide between SFTP mode and local-filesystem mode
-    before attempting any SFTP operation.
-
-    Required keys: SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD
+    Pure key check — no network connection is made.
     """
     try:
         host     = st.secrets.get("SFTP_HOST", "").strip()
@@ -69,7 +48,6 @@ def is_sftp_configured() -> bool:
         password = st.secrets.get("SFTP_PASSWORD", "").strip()
         return bool(host and username and password)
     except Exception:
-        # st.secrets raises FileNotFoundError when secrets.toml is absent
         return False
 
 
@@ -80,10 +58,6 @@ def _sftp_credentials() -> tuple:
     Returns
     -------
     (host, port, user, password, remote_dir)
-
-    Raises
-    ------
-    ValueError if mandatory credentials are absent.
     """
     host       = st.secrets.get("SFTP_HOST", "").strip()
     port       = int(st.secrets.get("SFTP_PORT", 22))
@@ -96,7 +70,7 @@ def _sftp_credentials() -> tuple:
     if not host or not user:
         raise ValueError(
             "SFTP credentials are not configured. "
-            "Set SFTP_HOST and SFTP_USERNAME in Streamlit secrets (.streamlit/secrets.toml)."
+            "Set SFTP_HOST and SFTP_USERNAME in Streamlit secrets."
         )
     if not password:
         raise ValueError(
@@ -107,16 +81,20 @@ def _sftp_credentials() -> tuple:
     return host, port, user, password, remote_dir
 
 
-@contextlib.contextmanager
-def _sftp_session():
-    """
-    Context manager that yields an open paramiko SFTPClient and the
-    configured remote directory path. Guarantees transport closure on exit.
+# ─── ISSUE 1: CONNECTION POOL ────────────────────────────────────────────────
+# @st.cache_resource persists the transport for the lifetime of the Streamlit
+# server process — shared across all reruns and all users on the same instance.
+# This means one SSH handshake instead of one per SFTP operation.
+#
+# get_sftp_transport() returns a live paramiko Transport. Callers must not
+# close it — it is owned by the cache. If the transport drops (server restart,
+# network interruption), clear_sftp_transport() forces a reconnect.
 
-    Usage
-    -----
-    with _sftp_session() as (sftp, remote_dir):
-        sftp.listdir(remote_dir)
+@st.cache_resource(show_spinner=False)
+def _get_sftp_transport():
+    """
+    Open and cache a single paramiko Transport for the process lifetime.
+    Called lazily on first SFTP operation. Never call .close() on the result.
     """
     try:
         import paramiko
@@ -126,87 +104,150 @@ def _sftp_session():
             "Install it with: pip install paramiko"
         )
 
-    host, port, user, password, remote_dir = _sftp_credentials()
+    host, port, user, password, _ = _sftp_credentials()
 
     transport = paramiko.Transport((host, port))
-    sftp      = None
     try:
         transport.connect()
         transport.auth_password(user, password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        yield sftp, remote_dir
     except paramiko.AuthenticationException:
+        transport.close()
         raise RuntimeError(
             "SFTP authentication failed. Check SFTP_USERNAME and SFTP_PASSWORD."
         )
+    except (paramiko.SSHException, OSError) as exc:
+        transport.close()
+        raise RuntimeError("SFTP connection error: {}".format(exc))
+
+    log.info("SFTP transport established to %s:%s", host, port)
+    return transport
+
+
+def clear_sftp_transport():
+    """
+    Force the cached transport to be closed and re-established on the next
+    SFTP call. Call this after a connection error to trigger reconnection.
+    """
+    _get_sftp_transport.clear()
+
+
+@contextlib.contextmanager
+def _sftp_session():
+    """
+    Context manager that yields an open SFTPClient and the configured
+    remote directory path, using the cached transport.
+
+    On transport failure, clears the transport cache so the next call
+    reconnects rather than reusing a dead connection.
+
+    Usage
+    -----
+    with _sftp_session() as (sftp, remote_dir):
+        sftp.listdir(remote_dir)
+    """
+    import paramiko
+
+    _, _, _, _, remote_dir = _sftp_credentials()
+    transport = _get_sftp_transport()
+
+    # If the cached transport has gone stale, clear it and raise so the
+    # caller can retry or surface the error.
+    if not transport.is_active():
+        clear_sftp_transport()
+        raise RuntimeError(
+            "SFTP transport dropped. Reload the page to reconnect."
+        )
+
+    sftp = None
+    try:
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        yield sftp, remote_dir
     except paramiko.SSHException as exc:
+        clear_sftp_transport()
         raise RuntimeError("SFTP SSH error: {}".format(exc))
     except OSError as exc:
+        clear_sftp_transport()
         raise RuntimeError("SFTP connection error: {}".format(exc))
     finally:
         if sftp:
             sftp.close()
-        if transport.is_active():
-            transport.close()
 
 
-# ─── FETCH (cached) ───────────────────────────────────────────────────────────
+# ─── ISSUE 2: LAZY PER-CONFIG FETCH ─────────────────────────────────────────
+# Previously fetch_all_raw_configs() read every config file on every cache miss.
+# Now:
+#   list_sftp_config_keys()  — fetches filenames only (one listdir call), TTL 60s
+#   fetch_raw_config()       — fetches a single config by key, TTL 300s per entry
+#   fetch_all_raw_configs()  — assembles the full dict from per-key cache entries
+#                              (retained for API compatibility with app.py)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def list_sftp_config_keys() -> list:
+    """
+    Return sorted list of customer keys from SFTP by listing filenames only.
+    Cached for 60 seconds. Much cheaper than reading every file — one listdir
+    call versus N file reads.
+    """
+    with _sftp_session() as (sftp, remote_dir):
+        try:
+            entries = sftp.listdir(remote_dir)
+        except IOError:
+            log.warning("SFTP mappings directory '%s' not found.", remote_dir)
+            return []
+
+    keys = [
+        f[:-4] for f in entries
+        if f.endswith(".csv") and f.lower() != "template.csv"
+    ]
+    log.info("Listed %d config key(s) from SFTP.", len(keys))
+    return sorted(keys)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_raw_config(customer_key: str) -> str:
+    """
+    Fetch a single config file from SFTP and return its content as a UTF-8 string.
+    Cached individually per customer key for 5 minutes.
+
+    Parameters
+    ----------
+    customer_key : str   Config filename stem, e.g. "gigly_gulp"
+
+    Returns
+    -------
+    str   Raw CSV content, or empty string if the file cannot be read.
+    """
+    with _sftp_session() as (sftp, remote_dir):
+        remote_path = "{}/{}.csv".format(remote_dir, customer_key)
+        try:
+            with sftp.open(remote_path, "r") as fh:
+                raw = fh.read()
+                return raw.decode("utf-8-sig")
+        except (IOError, UnicodeDecodeError) as exc:
+            log.warning("Could not read config '%s.csv': %s", customer_key, exc)
+            return ""
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_all_raw_configs() -> dict:
     """
     Load every .csv mapping config from the SFTP /mappings/ directory.
 
-    Each file is read as UTF-8 (with BOM tolerance) and stored verbatim
-    as a string, keyed by the filename stem (i.e. filename minus ".csv").
-    "template.csv" is always skipped.
+    Delegates to list_sftp_config_keys() + fetch_raw_config() so each
+    config is fetched and cached individually. A new config being added
+    only invalidates the key listing cache (60s TTL), not all config content.
 
     Returns
     -------
     dict : {customer_key: csv_string}
-
-    Cached for 5 minutes (ttl=300) to avoid round-tripping to SFTP on
-    every Streamlit rerun. Call fetch_all_raw_configs.clear() to bust
-    the cache immediately after a write operation.
-
-    Raises
-    ------
-    RuntimeError on SFTP connection / auth failure.
     """
+    keys        = list_sftp_config_keys()
     raw_configs = {}
-
-    with _sftp_session() as (sftp, remote_dir):
-        # Ensure the mappings directory exists
-        try:
-            entries = sftp.listdir(remote_dir)
-        except IOError:
-            log.warning(
-                "SFTP mappings directory '%s' does not exist — "
-                "returning empty config set.",
-                remote_dir,
-            )
-            return {}
-
-        for filename in entries:
-            if not filename.endswith(".csv"):
-                continue
-            if filename.lower() == "template.csv":
-                continue
-
-            customer_key = filename[:-4]   # strip .csv extension
-            remote_path  = "{}/{}".format(remote_dir, filename)
-
-            try:
-                with sftp.open(remote_path, "r") as fh:
-                    raw = fh.read()
-                    # Tolerate UTF-8 BOM that Excel sometimes writes
-                    raw_configs[customer_key] = raw.decode("utf-8-sig")
-            except (IOError, UnicodeDecodeError) as exc:
-                log.warning(
-                    "Could not read config '%s': %s — skipped.", filename, exc
-                )
-
-    log.info("Fetched %d config(s) from SFTP.", len(raw_configs))
+    for key in keys:
+        content = fetch_raw_config(key)
+        if content:
+            raw_configs[key] = content
+    log.info("Assembled %d config(s) from per-key cache.", len(raw_configs))
     return raw_configs
 
 
@@ -216,35 +257,14 @@ def parse_config_from_csv_string(csv_string: str, customer_key: str) -> dict:
     """
     Parse a CSV mapping config string into the standard config dict.
 
-    Mirrors converter.load_customer_config() but operates on an in-memory
-    string rather than a filesystem path, so no local files are needed.
-
     Expected CSV structure
     ----------------------
     customer_column | wms_field   | customer_name       | date_format
     DocNo           | ORDER_REF   | Gigly Gulp Sdn Bhd  | %d/%m/%Y
     DocDate         | ORDER_DATE  |                     |
-    ...
 
     Required columns : customer_column, wms_field
-    Optional columns : customer_name (first non-blank value wins)
-                       date_format   (first non-blank value wins)
-
-    Parameters
-    ----------
-    csv_string   : str   Raw CSV content
-    customer_key : str   Used for error messages and name derivation
-
-    Returns
-    -------
-    dict :
-        customer_name : str
-        column_map    : dict {customer_column: wms_field}
-        date_format   : str or None
-
-    Raises
-    ------
-    ValueError on any structural problem with the config.
+    Optional columns : customer_name, date_format
     """
     try:
         df = pd.read_csv(StringIO(csv_string), dtype=str)
@@ -253,10 +273,8 @@ def parse_config_from_csv_string(csv_string: str, customer_key: str) -> dict:
             "Could not parse config for '{}': {}".format(customer_key, exc)
         )
 
-    # Normalise headers
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # Validate required columns
     required = {"customer_column", "wms_field"}
     missing  = required - set(df.columns)
     if missing:
@@ -267,11 +285,9 @@ def parse_config_from_csv_string(csv_string: str, customer_key: str) -> dict:
             )
         )
 
-    # Strip all cell values
     for col in df.columns:
         df[col] = df[col].astype(str).str.strip()
 
-    # Extract optional metadata — first non-blank value in each column
     def _first_value(col_name):
         if col_name not in df.columns:
             return None
@@ -288,13 +304,12 @@ def parse_config_from_csv_string(csv_string: str, customer_key: str) -> dict:
     )
     date_format = _first_value("date_format")
 
-    # Keep only the two mapping columns
     df = df[["customer_column", "wms_field"]].copy()
 
-    # Drop rows where either column is blank / null-like
+    # Issue 6: use NULL_STRINGS imported from converter instead of redefining
     df = df[
-        ~df["customer_column"].isin(_NULL_STRINGS) &
-        ~df["wms_field"].isin(_NULL_STRINGS)
+        ~df["customer_column"].isin(NULL_STRINGS) &
+        ~df["wms_field"].isin(NULL_STRINGS)
     ]
 
     if df.empty:
@@ -302,7 +317,6 @@ def parse_config_from_csv_string(csv_string: str, customer_key: str) -> dict:
             "Config '{}' has no valid mapping rows.".format(customer_key)
         )
 
-    # Duplicate customer_column entries are an error — last-write-wins is silent
     dupes = df[df["customer_column"].duplicated()]["customer_column"].tolist()
     if dupes:
         raise ValueError(
@@ -312,7 +326,6 @@ def parse_config_from_csv_string(csv_string: str, customer_key: str) -> dict:
             )
         )
 
-    # All wms_field values must be recognised WMS fields
     invalid = [v for v in df["wms_field"] if v not in ALL_WMS_FIELDS]
     if invalid:
         raise ValueError(
@@ -338,27 +351,12 @@ def validate_all_sftp_configs(raw_configs: dict) -> dict:
     """
     Validate every SFTP-loaded config and return a health report.
 
-    Mirrors converter.validate_all_customer_configs() but operates on the
-    in-memory dict from fetch_all_raw_configs() rather than local files.
-
-    Missing mandatory WMS field mappings are classified as *errors* (not
-    warnings) so that config_is_valid stays False when mandatory fields
-    are absent — consistent with what validate() would raise at runtime.
-
-    Parameters
-    ----------
-    raw_configs : dict   {customer_key: csv_string} from fetch_all_raw_configs()
+    Missing mandatory WMS field mappings are classified as errors so that
+    config_is_valid stays False when mandatory fields are absent.
 
     Returns
     -------
-    dict :
-        {
-          customer_key: {
-            "errors":   [str, ...],
-            "warnings": [str, ...],
-            "config":   dict or None   ← None when errors is non-empty
-          }
-        }
+    dict : {customer_key: {"errors": [...], "warnings": [...], "config": dict or None}}
     """
     reports = {}
 
@@ -383,7 +381,6 @@ def validate_all_sftp_configs(raw_configs: dict) -> dict:
         reports[customer_key] = {
             "errors":   errors,
             "warnings": warnings,
-            # Only expose the config object when fully valid
             "config":   config if not errors else None,
         }
 
@@ -400,30 +397,25 @@ def list_sftp_customers(raw_configs: dict) -> list:
 def upload_config_csv(customer_key: str, csv_string: str) -> dict:
     """
     Write (or overwrite) a mapping config on the SFTP server.
-
-    The file is written to: {SFTP_MAPPINGS_DIR}/{customer_key}.csv
-
-    Parameters
-    ----------
-    customer_key : str   Config key (filename stem)
-    csv_string   : str   CSV content to write
-
-    Returns
-    -------
-    dict : {success: bool, message: str}
+    Writes as UTF-8 bytes in binary mode to avoid double line endings on Windows.
     """
     try:
         with _sftp_session() as (sftp, remote_dir):
             remote_path = "{}/{}.csv".format(remote_dir, customer_key)
 
-            # Ensure mappings directory exists
             try:
                 sftp.stat(remote_dir)
             except IOError:
                 sftp.mkdir(remote_dir)
 
-            with sftp.open(remote_path, "w") as fh:
-                fh.write(csv_string)
+            # Binary mode + explicit encoding avoids \r\r\n on Windows
+            with sftp.open(remote_path, "wb") as fh:
+                fh.write(csv_string.encode("utf-8-sig"))
+
+        # Invalidate the per-key cache for this config so the next read
+        # reflects the new content without waiting for TTL expiry.
+        fetch_raw_config.clear()
+        fetch_all_raw_configs.clear()
 
         log.info("Uploaded config '%s.csv' to SFTP.", customer_key)
         return {
@@ -452,21 +444,8 @@ def merge_and_save_mappings(
     """
     Merge UI-defined column mappings into the existing config and save to SFTP.
 
-    Rules
-    -----
-    - new_mappings entries override existing entries on customer_column conflict.
-    - Deduplication is based on customer_column; last occurrence wins after concat.
-    - Only validated WMS fields are accepted in new_mappings (caller responsibility).
-
-    Parameters
-    ----------
-    customer_key        : str    Config key
-    existing_csv_string : str    Current raw CSV from SFTP (may be empty string)
-    new_mappings        : dict   {customer_column: wms_field} from UI
-
-    Returns
-    -------
-    dict : {success: bool, message: str, rows_added: int}
+    new_mappings entries override existing entries on customer_column conflict.
+    rows_added reflects genuinely new columns only (not overwrites).
     """
     if not new_mappings:
         return {
@@ -475,13 +454,11 @@ def merge_and_save_mappings(
             "rows_added": 0,
         }
 
-    # ── Load existing config ──────────────────────────────────────────────────
     if existing_csv_string.strip():
         try:
             df_existing = pd.read_csv(StringIO(existing_csv_string), dtype=str)
             df_existing.columns = [c.strip().lower() for c in df_existing.columns]
 
-            # Ensure the required columns exist after normalisation
             if "customer_column" not in df_existing.columns or \
                "wms_field" not in df_existing.columns:
                 df_existing = pd.DataFrame(columns=["customer_column", "wms_field"])
@@ -493,21 +470,22 @@ def merge_and_save_mappings(
     else:
         df_existing = pd.DataFrame(columns=["customer_column", "wms_field"])
 
-    # ── Build new rows ────────────────────────────────────────────────────────
     df_new = pd.DataFrame(
         [{"customer_column": k, "wms_field": v} for k, v in new_mappings.items()]
     )
 
-    # ── Merge: existing first, new last → drop_duplicates(keep="last") ───────
     df_merged = (
         pd.concat([df_existing, df_new], ignore_index=True)
         .drop_duplicates(subset=["customer_column"], keep="last")
         .reset_index(drop=True)
     )
 
-    rows_added = len(df_merged) - len(df_existing)
-    csv_out    = df_merged.to_csv(index=False)
+    # Count genuinely new columns (not overwrites of existing ones)
+    existing_cols = set(df_existing["customer_column"].tolist())
+    new_cols      = set(new_mappings.keys())
+    rows_added    = len(new_cols - existing_cols)
 
-    result = upload_config_csv(customer_key, csv_out)
-    result["rows_added"] = max(rows_added, 0)
+    csv_out = df_merged.to_csv(index=False)
+    result  = upload_config_csv(customer_key, csv_out)
+    result["rows_added"] = rows_added
     return result
