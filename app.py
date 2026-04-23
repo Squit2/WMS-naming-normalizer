@@ -52,7 +52,6 @@ import pandas as pd
 
 # ── Core processing (never modified) ──────────────────────────────────────────
 from converter import (
-    validate_all_customer_configs,
     read_order_file,
     apply_mapping,
     validate,
