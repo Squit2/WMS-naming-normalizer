@@ -61,6 +61,9 @@ from sftp_router import (
     make_output_stem
 )
 
+# ── Hourly auto-processor ─────────────────────────────────────────────────────
+import auto_processor
+
 # Bridge st.secrets → env vars consumed by sftp_uploader.py
 for _key in ("SFTP_HOST", "SFTP_PORT", "SFTP_USER", "SFTP_PASSWORD",
              "SFTP_PRIVATE_KEY", "SFTP_TARGET_DIR"):
@@ -232,6 +235,21 @@ invalid_configs = sorted(
     key for key, r in all_config_reports.items() if r["errors"]
 )
 
+# ─── AUTO-PROCESSOR STARTUP ───────────────────────────────────────────────────
+# Start the hourly background thread once per process.  The lambdas are
+# evaluated fresh on each sweep so newly-uploaded configs are picked up.
+
+if USE_SFTP:
+    _auto_interval = int(st.secrets.get("AUTO_PROCESSOR_INTERVAL_SECONDS", 3600))
+    _auto_default  = st.secrets.get("AUTO_PROCESSOR_DEFAULT_CUSTOMER", None)
+
+    auto_processor.start_background_processor(
+        get_customers_fn   = lambda: list_sftp_customers(fetch_all_raw_configs()),
+        get_raw_configs_fn = fetch_all_raw_configs,
+        interval_seconds   = _auto_interval,
+        default_customer   = _auto_default,
+    )
+
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 
@@ -270,6 +288,27 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+
+    # ── Auto-processor status & manual trigger ───────────────────────────────
+    if USE_SFTP:
+        auto_processor.render_sidebar_status()
+
+        _default = st.secrets.get("AUTO_PROCESSOR_DEFAULT_CUSTOMER") if USE_SFTP else None
+        if st.button("▶ Run auto-sweep now", help="Process all pending SFTP files immediately."):
+            with st.spinner("Running auto-sweep…"):
+                _sweep_results = auto_processor.trigger_immediate_sweep(
+                    customers, raw_configs, _default
+                )
+            _ok  = sum(1 for r in _sweep_results if r["status"] == "ok")
+            _err = sum(1 for r in _sweep_results if r["status"] in ("error_rows", "failed"))
+            _skp = sum(1 for r in _sweep_results if r["status"] == "skipped")
+            if _sweep_results:
+                st.success(f"Sweep done — {_ok} ok · {_err} error(s) · {_skp} skipped.")
+            else:
+                st.info("Sweep done — no pending files found.")
+            st.rerun()
+
+        st.divider()
 
     # ── Upload a new mapping config ──────────────────────────────────────────
     st.subheader("Upload config")
