@@ -718,13 +718,13 @@ if file_bytes and config_is_valid:
         st.subheader("6. Review")
         _t1, _t2, _t3 = st.tabs(["Mapped output", "Error rows", "Raw input"])
 
-        with _t1:
+       with _t1:
             if proc["df_clean"].empty:
                 st.warning("No valid rows.")
             else:
                 _mand = [f for f in MANDATORY_FIELDS if f in proc["df_clean"].columns]
-                st.caption(f"{len(proc['df_clean'])} valid rows. Mandatory fields: {', '.join(_mand)}")
-                st.dataframe(proc["df_clean"], use_container_width=True, hide_index=True)
+                st.caption(f"{len(proc['df_clean'])} valid rows processed. (Showing top 500 in preview)")
+                st.dataframe(proc["df_clean"].head(10), use_container_width=True, hide_index=True)
 
         with _t2:
             if proc["df_errors"].empty:
