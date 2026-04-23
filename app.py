@@ -606,24 +606,32 @@ if file_bytes and config_is_valid:
             if not df_errors.empty else b""
         )
 
-        # ── Folder-mode: route outputs to FileZilla ─────────────────────────
+       # ── Folder-mode: route outputs to FileZilla ─────────────────────────
         routing_log = []   
 
         if is_folder_mode and source_name:
             output_stem = make_output_stem(source_name, ts)
             
             with st.spinner("Routing files on SFTP server..."):
-                # 1. Write processed CSV
-                if csv_bytes_out:
+                
+                # STRICT RULE: If there are ANY errors, block the Processed upload
+                if err_bytes_out:
+                    # 1. Write the error CSV
+                    _r = write_error(err_bytes_out, Path(source_name).stem, ts)
+                    routing_log.append(("⚠️" if _r["success"] else "❌", _r["message"]))
+                    
+                    # 2. Log the blockage
+                    routing_log.append(("🛑", "Errors detected. Conversion blocked and not sent to Processed/."))
+                    
+                    # Also wipe the download payload for the UI so they don't accidentally download it
+                    csv_bytes_out = b"" 
+                    
+                elif csv_bytes_out:
+                    # NO ERRORS: Write the processed CSV
                     _r = write_processed(csv_bytes_out, Path(source_name).stem, ts)
                     routing_log.append(("✅" if _r["success"] else "❌", _r["message"]))
 
-                # 2. Write error CSV
-                if err_bytes_out:
-                    _r = write_error(err_bytes_out, Path(source_name).stem, ts)
-                    routing_log.append(("⚠️" if _r["success"] else "❌", _r["message"]))
-
-                # 3. Archive source (Server-side rename)
+                # 3. Archive source (Server-side rename) happens for both successes and errors
                 _arc = archive_source_file(source_name, ts)
                 routing_log.append(("📦" if _arc["success"] else "❌", _arc["message"]))
 
