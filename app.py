@@ -718,7 +718,7 @@ if file_bytes and config_is_valid:
         st.subheader("6. Review")
         _t1, _t2, _t3 = st.tabs(["Mapped output", "Error rows", "Raw input"])
 
-       with _t1:
+        with _t1:
             if proc["df_clean"].empty:
                 st.warning("No valid rows.")
             else:
