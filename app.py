@@ -124,7 +124,6 @@ if USE_SFTP:
     st.info(
         "☁ **SFTP mode** — mapping configs are loaded from and saved to the "
         "SFTP config store. Changes persist across restarts.",
-        icon="☁",
     )
 else:
     st.info(
@@ -132,7 +131,6 @@ else:
         "`mappings/` directory. "
         "Add SFTP credentials to `.streamlit/secrets.toml` to enable "
         "cloud persistence.",
-        icon="💾",
     )
 
 
