@@ -720,10 +720,11 @@ if file_bytes and config_is_valid:
                 else:
                     st.success("{} {}".format(_icon, _msg))
 
+            _ws = st.secrets.get("SFTP_WORKSPACE_DIR", "/client_mocks").rstrip("/")
             _folder_map = {
-                "Processed": str(PROCESSED_DIR),
-                "Error":     str(ERROR_DIR),
-                "Archive":   str(ARCHIVE_DIR),
+                "Processed": f"{_ws}/Processed",
+                "Error":     f"{_ws}/Error",
+                "Archive":   f"{_ws}/Archive",
             }
             with st.expander("Folder paths"):
                 for _name, _path in _folder_map.items():
