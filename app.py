@@ -61,7 +61,6 @@ from converter import (
     ordered_wms_columns,
     ALL_WMS_FIELDS,
     MANDATORY_FIELDS,
-    MAPPINGS_DIR,
     MAX_CONFIG_BYTES,
 )
 
